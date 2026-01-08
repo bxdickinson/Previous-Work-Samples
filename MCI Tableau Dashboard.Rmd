@@ -1,0 +1,688 @@
+---
+title: "MCI 11.10.23"
+Last updated: "9.11.24"
+author: "Bethany"
+date: "2023-11-10"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+Inputs
++ Google Survey: https://docs.google.com/forms/d/1cpKv1O3uvKFROSiRCdUOipcjm7Jq43USZ4nJe5PGi6E/edit?usp=drive_web
++ Google Survey Responses "Form Responses 1": https://docs.google.com/spreadsheets/d/1LDvLcImAOBl68p1t-gWjII0dQQuAnzLHJuEriXYoNHQ/edit?gid=607136430#gid=607136430
+
+
+Outputs
++ Googlesheet tabs found in this workbook: https://docs.google.com/spreadsheets/d/1LDvLcImAOBl68p1t-gWjII0dQQuAnzLHJuEriXYoNHQ/edit?gid=607136430#gid=607136430 
+  + question scores
+  + individual capacity
+  + yrs at mission
+  + hiring mechanism
+  
+# NOTE: DO NOT KNIT THIS RMARKDOWN. JUST RUN THE CODE CHUNKS.
+Note: This code had to be edited after this project was completed in March 2024 because the dimension score calculations were off and taking the average of the average. The Rmd had to be updated to reflect more accurate calculations and the dashboard itself had to be edited to use a different data source (new output as seen below in the code)
+
+
+## Read in Libraries and Raw Data
+This is reading the following google sheet workbook: https://docs.google.com/spreadsheets/d/1LDvLcImAOBl68p1t-gWjII0dQQuAnzLHJuEriXYoNHQ/edit?gid=897519581#gid=897519581
+Which contains the actual raw survey responses found in "Form Responses". 
+Some data transformations need to take place under the clean and process data steps below before using it in Tableau
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(googledrive)
+library(googlesheets4)
+library(janitor)
+
+
+raw_data <- read_sheet(
+  "https://docs.google.com/spreadsheets/d/1LDvLcImAOBl68p1t-gWjII0dQQuAnzLHJuEriXYoNHQ/edit#gid=607136430", sheet = "Form Responses 1", skip = 2)
+
+
+# Remove line breaks from all column names
+names(raw_data) <- gsub("\n", "_", names(raw_data))
+
+
+# Read in mapping files
+
+# Mission filter. Lesley wants to add all possible Missions to the dashboard, even if they don't have survey data. She wants to see country context indicators, so for now just add in Missions and add 0 for their score averages per Lesley's request 11/8/23
+mission_mapping <- read_sheet(
+  "https://docs.google.com/spreadsheets/d/1FMBkc5tuyRVvAusa-Vvj_ug59_h9eEHazCebU2Jwmg8/edit#gid=899029380", sheet = "mission mapping", ) 
+
+# Map on dimension and sub-dimension for each question
+mapping <- read_sheet("https://docs.google.com/spreadsheets/d/1LDvLcImAOBl68p1t-gWjII0dQQuAnzLHJuEriXYoNHQ/edit#gid=607136430", sheet = "mapping") 
+
+# Detect if any data is nested
+str(raw_data)
+
+
+```
+
+## Clean and Process Data
+```{r clean, include = FALSE}
+
+# Step 1 - Check for NAs - if there are NAs it means respondents skipped questions. Those will need to be filled in with Step 2 below
+colSums(is.na(raw_data))
+
+# Step 2 - Encode Y/N/Idk questions: Replace all Yes - 5, all No - 1, all Idks - 0
+# These numeric codes were determined by the client. All questions are measured along a 5 point scale and the client decided that a Yes response would be worth 5 points and a No response would be worth 1 point and an Idk response would be worth 0 points. An idk response is an uncertain response and does not have as much weight as Yes/No.
+clean_data <- raw_data %>%
+  select(-1:-2, -72:-77) %>%  # remove columns 1 timestamp, 2 email, 72:77 survey feedback qs since they aren't necessary for aggregating scores
+  mutate(across(everything(), ~str_replace( ., "\\bYes\\b", "5" ))) %>%
+  mutate(across(everything(), ~str_replace( ., "\\bNo\\b", "1" ))) %>%
+  mutate(across(everything(), ~str_replace( ., "\\bI don't know\\b", "0")))
+
+# Step 3 - Validate skipped questions. 
+# NOTE: This is changing some of the answers in the raw data, if respondents didn't read the instructions accurately. i.e. Djibouti ques 1.4-1.8
+# NOTE: The following code in this step is using column location. However, if the columns move around or new columns are added, then these column locations are not relevant and need to be manually updated
+# If a respondent answered No (1) or Idk (0) for the first question in the series, then impute 1 or 0 for the subsequent skipped questions in that series
+# This will tell you the row line where either response occurs
+
+
+# Column position 8 is question 1.4. Positions 9-12 refer to questions 1.5, 1,6, 1,7 and 1.8 which should be skipped/imputed
+cols14 <- c(9:12)
+idk14 <- which(clean_data[, 8] == 0) # this identifies which rows are 0/Idk for ques 1.4
+no14 <- which(clean_data[, 8] == 1) # this identifies which rows are 1/No for ques 1.4
+
+# Column position 26 is question 1.22. Positions 27-28 refer to questions 1.23 and 1.24 which should be skipped/imputed
+cols122 <- c(27:28)
+idk122 <- which(clean_data[, 26] == 0)
+no122 <- which(clean_data[, 26] == 1)
+
+# Column position 53 is question 3.1. Positions 54-56 refer to questions 3.2, 3.3 and 3.4 which should be skipped/imputed
+cols31 <- c(54:56)
+idk31 <- which(clean_data[, 53] == 0)
+no31 <- which(clean_data[, 53] == 1)
+
+# if ques 1.4, 1.22, 3.1 are 0/idk turn the sequence of ques into 0/Idk
+# if ques 1.4, 1.22, 3.1 are 1/No turn the sequence of ques into 1/No
+clean_data2 <- clean_data %>%
+  mutate(across(cols14, ~ifelse(row_number() %in% idk14, 0, .))) %>%
+  mutate(across(cols14, ~ifelse(row_number() %in% no14, 1, .))) %>%
+  mutate(across(cols122, ~ifelse(row_number() %in% idk122, 0, .))) %>%
+  mutate(across(cols122, ~ifelse(row_number() %in% no122, 1, .))) %>%
+  mutate(across(cols31, ~ifelse(row_number() %in% idk31, 0, .))) %>%
+  mutate(across(cols31, ~ifelse(row_number() %in% no31, 1, .)))
+
+
+# Step 3a - If a question that should not be SKIPPED is left blank, impute 0/idk for their response
+# Identify if there are any remaining NAs/blanks. There shouldn't be at this point. This could be due to a respondent accidentally skipping a question when they shouldn't have
+# This tells you which row position and column position the NAs appear in the original dataframe
+nas <- which(is.na(clean_data2), arr.ind = T) # this will tell you row # and column index # where the NA appears
+
+nulls <- which(is.null(clean_data2), arr.ind = T)
+
+
+# This will pull out the specific rows and columns where the NA value occurs
+NAs <- clean_data2 %>%
+  rowid_to_column() %>%  # Adds a column with row numbers
+  select(rowid, where(~any(is.na(.)))) %>%
+  filter(rowSums(is.na(.)) > 0)
+
+# According to Lesley impute 0 for NAs assuming that the respondent did know. However, this may change later down the road if more NAs appears, depending on the question asked and if it should NOT be skipped
+clean_data2.1 <- clean_data2 %>%
+  mutate(across(everything(), ~replace_na(., "0"))) 
+ 
+
+# Check to see if any remaining NAs exist. This should be 0
+which(is.na(clean_data2.1), arr.ind = T)
+
+
+# Step 4 - Pivot data longer to eventually map on dimension and sub-dimension
+clean_data3 <- clean_data2.1 %>%
+  pivot_longer(cols = 5:69,
+               names_to = "question",
+               values_to = "value") 
+
+# No NAs should exist at this point
+colSums(is.na(clean_data3))  
+ 
+# Step 5 - Map on dimension and sub-dimension for each question
+mapping <- read_sheet("https://docs.google.com/spreadsheets/d/1LDvLcImAOBl68p1t-gWjII0dQQuAnzLHJuEriXYoNHQ/edit#gid=607136430", sheet = "mapping") 
+
+clean_data4 <- clean_data3 %>%
+  left_join(mapping, by = "question") %>% 
+  mutate(value = as.numeric(value)) # turn value column into numeric
+
+
+colSums(is.na(clean_data4)) # sub-dimension can have NAs only for questions 4.1:4.5 since these are individual capacity questions and don't have a sub-dimension assigned to them
+
+# Step 6 - Create a list of subsetted mission datasets from the google form sheet
+missions <- split(clean_data4, clean_data4$Mission) # split by mission
+
+# This will take that list created above and split it out into their own dataframes in the R environment
+ for (factor_name in names(missions)) {
+  # Generate a valid variable name
+  valid_name <- make.names(factor_name)
+
+  # Create a new dataframe with the subset data
+  assign(valid_name, missions[[factor_name]])
+}
+
+rm(clean_data, clean_data2, clean_data2.1, clean_data3, clean_data4, nas, NAs)
+
+```
+
+
+The following code chunks below are measuring the sum of scores across various hierarchical levels, starting with dimension across (office, yrs at mission, hiring mechanism), then by sub-dimension across the same sub-levels. This is the raw data used in the Dashboard. The google sheets outputted below are exported to this master google sheet https://docs.google.com/spreadsheets/d/1LDvLcImAOBl68p1t-gWjII0dQQuAnzLHJuEriXYoNHQ/edit?gid=897519581#gid=897519581, which also contains the raw survey responses from the google from
+Calculations for finding the average and response rate are done in Tableau rather than in R
+1) Dimension Chart 
+2) Sub-Dimension Chart 
+3) Top Qs 
+4) Bottom Qs
+5) Recommendations Table
+
+### QUESTION SCORES: 1) All Responses
+```{r}
+
+## 1) All Responses by Questions ##
+all_quesclean <- function(x) {
+   
+avg <- x %>%
+    group_by(dimension, question) %>%
+    summarize(dim_num = sum(value[value != 0]),
+              dim_den = sum(!is.na(value[value != 0]))) 
+    
+
+stat <- x %>%
+    group_by(question) %>%
+    summarize(total_resp = n(),
+            no_idk = sum(value != 0, na.rm = T)) %>% # Count complete responses, in other words, out of total responses, how many respondents did NOT answer idk. Exclude all idks
+    mutate(dashboard = "show")
+
+combine <- stat %>%
+    left_join(avg, by = "question") %>%
+    left_join(mapping, by = c("question", "dimension")) %>%
+    mutate(category = "all responses") %>%
+    relocate(dashboard, .after = dim_den) %>%
+    relocate(dimension, .before = sub_dimension) %>%
+    mutate(category_type = "all reponses")
+}
+
+# Apply dimension function on the list of missions "missions"
+ques_score <- lapply(missions, all_quesclean) 
+
+# Create a new column called Mission in which Mission will autopopulate with Mission name pulled from Ques_Score from the line above
+for (i in seq_along(ques_score)) {
+  # Pull out Mission names from "Ques_Score" list and put them into a vector
+  file_names <- names(ques_score)
+  
+  ques_score[[i]]$mission<- file_names[i]
+}
+
+# Output each mission scores to the R environment and name each outputted df with pre-fix "Question" to denote these are question scores
+ques_dfs <- function(dfs, ques_score) {
+  assign(paste0("allques_", ques_score), dfs, envir =.GlobalEnv)
+}
+
+# Apply ques_dfs function to ques_score list
+lapply(names(ques_score), function(name) {
+  ques_dfs(ques_score[[name]], name)
+})
+
+# Bind all "Question_x mission" together into one df so we can output to the googlesheet. This will include all mission and their scores by question
+final_allques <- bind_rows(mget(ls(pattern = "^allques_"))) 
+
+final_allques1 <- bind_rows(final_allques, mission_mapping %>% 
+                              mutate(dim_num = 0,
+                                     dim_den = 0,
+                                     category_type = "all responses"))
+
+######### Do some checks on final_allques1 ############
+colSums(is.na(final_allques1)) # 78 NAs is okay bc those are missions that have not filled out the survey yet, but need to appear in the drop down options
+
+str(final_allques1)
+
+dupes <- get_dupes(final_allques1, question, mission)
+
+
+# Remove unnecessary dataframes
+rm(list = ls(pattern = "^allques_"))
+rm(final_allques)
+
+
+# Do some additional checks on specific mission data and see if these numbers align with final_allques1
+avg <- Jamaica %>%
+    group_by(dimension, question) %>%
+    summarize(dim_num = sum(value[value != 0]),
+              dim_den = sum(!is.na(value[value != 0]))) #%>% #create this calculation in tableau
+    #mutate(dim_avg = dim_num/dim_den)
+
+
+stat <- Jamaica %>%
+    group_by(question) %>%
+    summarize(total_resp = n(),
+            no_idk = sum(value != 0, na.rm = T)) %>% # how many respondents out of total possible responses answered idk?
+    mutate(dashboard = "show") #%>%
+    #mutate(response_rate = round(no_idk/total_resp,2)) %>% #create this calculation in tableau
+    #mutate(conf_rate = NA) %>% # create conf_rate column # create this calculation in tableau
+    #mutate(conf_rate = ifelse(response_rate <0.5, "Low", # create categorization range for conf rate
+                              #ifelse(response_rate >0.75, "High", 
+                                     #"Medium"))) 
+
+combine <- stat %>%
+    left_join(avg, by = "question") %>%
+    left_join(mapping, by = c("question", "dimension")) %>%
+    mutate(category = "all responses") %>%
+    relocate(dashboard, .after = dim_den) %>%
+    relocate(dimension, .before = sub_dimension) %>%
+    mutate(category_type = "all reponses")
+
+
+```
+### QUESTION SCORES: 2) Office Name
+```{r}
+## 2) Office ##
+off_quesclean <- function(x) {
+  
+off_ques <- x %>%
+    group_by(dimension, question, `Office in Mission`) %>%
+    summarize(dim_num = sum(value[value != 0]),
+              dim_den = sum(!is.na(value[value != 0])))
+
+off_ques2 <- x %>%
+    group_by(dimension, question, `Office in Mission`) %>%
+    summarize(total_resp = n(),
+            no_idk = sum(value != 0, na.rm = T)) %>% # # Count complete responses, in other words, out of total responses, how many respondents did NOT answer idk. Exclude all idks
+    mutate(dashboard = case_when(total_resp < 3 ~ "don't show",
+                            TRUE ~ "show")) 
+
+off_ques3 <- off_ques2 %>%
+    left_join(off_ques, by = c("question", "Office in Mission", "dimension")) %>%
+    left_join(mapping, by = c("question", "dimension")) %>%
+    mutate(category = "office") %>%
+    rename(category_type = `Office in Mission`) %>%
+    relocate(dashboard, .after = dim_den) %>%
+    relocate(dimension, .before = sub_dimension) %>%
+    relocate(category_type, .after = category)
+}
+
+# Apply dimension function on the list of missions "missions"
+offques_score <- lapply(missions, off_quesclean) 
+
+# Create a new column called Mission in which Mission will autopopulate with Mission name pulled from Ques_Score from the line above
+for (i in seq_along(offques_score)) {
+  # Pull out Mission names from "Ques_Score" list and put them into a vector
+  file_names <- names(offques_score)
+  
+  offques_score[[i]]$mission<- file_names[i]
+  
+  # Combine all dfs in offques_score list into one df and name it final_offques
+  final_offques <- do.call("rbind", offques_score)
+}
+
+# Remove unnecessary dataframes
+rm(list = ls(pattern = "^offques_"))
+
+######### Do some checks ############
+colSums(is.na(final_offques)) # sub-dimension NAs are fine bc individual capacity doesn't have sub-dimensions related to it
+
+str(final_offques)
+
+dupes <- get_dupes(final_offques, question, mission, category_type)
+
+
+# Do some additional checks on specific mission data and see if these numbers align with final_allques1
+offavg <- Bangladesh %>%
+    group_by(dimension, question, `Office in Mission`) %>%
+    summarize(dim_num = sum(value[value != 0]),
+              dim_den = sum(!is.na(value[value != 0]))) #%>% #create this calculation in tableau
+    #mutate(dim_avg = dim_num/dim_den)
+
+
+offstat <- Bangladesh %>%
+    group_by(dimension, question, `Office in Mission`) %>%
+    summarize(total_resp = n(),
+            no_idk = sum(value != 0, na.rm = T)) %>% # how many respondents out of total possible responses answered idk?
+    mutate(dashboard = case_when(total_resp < 3 ~ "don't show",
+                            TRUE ~ "show")) #%>%
+    #mutate(response_rate = round(no_idk/total_resp,2)) %>% #create this calculation in tableau
+    #mutate(conf_rate = NA) %>% # create conf_rate column # create this calculation in tableau
+    #mutate(conf_rate = ifelse(response_rate <0.5, "Low", # create categorization range for conf rate
+                              #ifelse(response_rate >0.75, "High", 
+                                     #"Medium"))) 
+
+offcombine <- offstat %>%
+    left_join(offavg, by = c("question", "Office in Mission", "dimension")) %>%
+    left_join(mapping, by = c("question", "dimension")) %>%
+    mutate(category = "office") %>%
+    rename(category_type = `Office in Mission`) %>%
+    relocate(dashboard, .after = dim_den) %>%
+    relocate(dimension, .before = sub_dimension) %>%
+    relocate(category_type, .after = category)
+
+
+```
+### QUESTION SCORES: 3) Yrs at Mission
+```{r}
+## 3) Years at Mission ##
+yr_quesclean <- function(x) {
+
+yr_ques <- x %>%
+    group_by(dimension, question, `Years at Mission`) %>%
+    summarize(dim_num = sum(value[value != 0]),
+              dim_den = sum(!is.na(value[value != 0]))) 
+
+
+yr_ques2 <- x %>%
+    group_by(dimension, question, `Years at Mission`) %>%
+    summarize(total_resp = n(),
+            no_idk = sum(value != 0, na.rm = T)) %>% # # Count complete responses, in other words, out of total responses, how many respondents did NOT answer idk. Exclude all idks
+    mutate(dashboard = case_when(total_resp < 3 ~ "don't show",
+                            TRUE ~ "show")) 
+git s
+yr_ques3 <- yr_ques2 %>%
+    left_join(yr_ques, by = c("question", "Years at Mission", "dimension")) %>%
+    left_join(mapping, by = c("question", "dimension")) %>%
+    mutate(category = "yrs at mission") %>%
+    rename(category_type = `Years at Mission`) %>%
+    relocate(dashboard, .after = dim_den) %>%
+    relocate(dimension, .before = sub_dimension) %>%
+    relocate(category_type, .after = category)
+}
+
+# Apply dimension function on the list of missions "missions"
+yrques_score <- lapply(missions, yr_quesclean) 
+
+# Create a new column called Mission in which Mission will autopopulate with Mission name pulled from Ques_Score from the line above
+for (i in seq_along(yrques_score)) {
+  # Pull out Mission names from "Ques_Score" list and put them into a vector
+  file_names <- names(yrques_score)
+  
+  yrques_score[[i]]$mission<- file_names[i]
+  
+  final_yrques <- do.call("rbind", yrques_score)
+}
+  
+# Remove unnecessary dfs
+rm(list = ls(pattern = "^yrques_"))
+
+
+######### Do some checks ############
+colSums(is.na(final_yrques)) # sub-dimension NAs are fine bc individual capacity doesn't have sub-dimensions related to it
+
+str(final_yrques)
+
+dupes <- get_dupes(final_yrques, question, mission, category_type)
+
+
+# Do some additional checks on specific mission data and see if these numbers align with final_allques1
+yravg <- Bangladesh %>%
+    group_by(dimension, question, `Years at Mission`) %>%
+    summarize(dim_num = sum(value[value != 0]),
+              dim_den = sum(!is.na(value[value != 0]))) #%>% #create this calculation in tableau
+    #mutate(dim_avg = dim_num/dim_den)
+
+
+yrstat <- Bangladesh %>%
+    group_by(dimension, question, `Years at Mission`) %>%
+    summarize(total_resp = n(),
+            no_idk = sum(value != 0, na.rm = T)) %>% # how many respondents out of total possible responses answered idk?
+    mutate(dashboard = case_when(total_resp < 3 ~ "don't show",
+                            TRUE ~ "show")) #%>%
+    #mutate(response_rate = round(no_idk/total_resp,2)) %>% #create this calculation in tableau
+    #mutate(conf_rate = NA) %>% # create conf_rate column # create this calculation in tableau
+    #mutate(conf_rate = ifelse(response_rate <0.5, "Low", # create categorization range for conf rate
+                              #ifelse(response_rate >0.75, "High", 
+                                     #"Medium"))) 
+
+yrcombine <- yrstat %>%
+    left_join(yravg, by = c("question", "Years at Mission", "dimension")) %>%
+    left_join(mapping, by = c("question", "dimension")) %>%
+    mutate(category = "yrs at mission") %>%
+    rename(category_type = `Years at Mission`) %>%
+    relocate(dashboard, .after = dim_den) %>%
+    relocate(dimension, .before = sub_dimension) %>%
+    relocate(category_type, .after = category)
+
+```    
+### QUESTION SCORES: 4) Hiring Mechanism
+```{r}
+
+hire_quesclean <- function(x) {
+  
+hire_ques <- x %>%
+    group_by(dimension, question, `Hiring Mechanism`) %>%
+    summarize(dim_num = sum(value[value != 0]),
+              dim_den = sum(!is.na(value[value != 0]))) 
+
+
+hire_ques2 <- x %>%
+    group_by(dimension, question, `Hiring Mechanism`) %>%
+    summarize(total_resp = n(),
+            no_idk = sum(value != 0, na.rm = T)) %>% # Count complete responses, in other words, out of total responses, how many respondents did NOT answer idk. Exclude all idks
+    mutate(dashboard = case_when(total_resp < 3 ~ "don't show",
+                            TRUE ~ "show"))
+
+hire_ques3 <- hire_ques2 %>%
+    left_join(hire_ques, by = c("question", "Hiring Mechanism", "dimension")) %>%
+    left_join(mapping, by = c("question", "dimension")) %>%
+    mutate(category = "hiring mechanism") %>%
+    rename(category_type = `Hiring Mechanism`) %>%
+    relocate(dashboard, .after = dim_den) %>%
+    relocate(dimension, .before = sub_dimension) %>%
+    relocate(category_type, .after = category)
+}
+
+
+# Apply dimension function on the list of missions "missions"
+hireques_score <- lapply(missions, hire_quesclean) 
+
+# Create a new column called Mission in which Mission will autopopulate with Mission name pulled from Ques_Score from the line above
+for (i in seq_along(hireques_score)) {
+  # Pull out Mission names from "Ques_Score" list and put them into a vector
+  file_names <- names(hireques_score)
+
+  hireques_score[[i]]$mission<- file_names[i]
+  
+  final_hireques <- do.call("rbind", hireques_score)
+}
+
+# Remove unnecessary dfs
+rm(list = ls(pattern = "^hireques_"))
+
+
+######### Do some checks ############
+colSums(is.na(final_hireques)) # sub-dimension NAs are fine bc individual capacity doesn't have sub-dimensions related to it
+
+str(final_hireques)
+
+dupes <- get_dupes(final_hireques, question, mission, category_type)
+
+
+# Do some additional checks on specific mission data and see if these numbers align with final_allques1
+hireavg <- Bangladesh %>%
+    group_by(dimension, question, `Hiring Mechanism`) %>%
+    summarize(dim_num = sum(value[value != 0]),
+              dim_den = sum(!is.na(value[value != 0]))) #%>% #create this calculation in tableau
+    #mutate(dim_avg = dim_num/dim_den)
+
+
+hirestat <- Bangladesh %>%
+    group_by(dimension, question, `Hiring Mechanism`) %>%
+    summarize(total_resp = n(),
+            no_idk = sum(value != 0, na.rm = T)) %>% # how many respondents out of total possible responses answered idk?
+    mutate(dashboard = case_when(total_resp < 3 ~ "don't show",
+                            TRUE ~ "show")) #%>%
+    #mutate(response_rate = round(no_idk/total_resp,2)) %>% #create this calculation in tableau
+    #mutate(conf_rate = NA) %>% # create conf_rate column # create this calculation in tableau
+    #mutate(conf_rate = ifelse(response_rate <0.5, "Low", # create categorization range for conf rate
+                              #ifelse(response_rate >0.75, "High", 
+                                     #"Medium"))) 
+
+hirecombine <- hirestat %>%
+    left_join(hireavg, by = c("question", "Hiring Mechanism", "dimension")) %>%
+    left_join(mapping, by = c("question", "dimension")) %>%
+    mutate(category = "hiring mechanism") %>%
+    rename(category_type = `Hiring Mechanism`) %>%
+    relocate(dashboard, .after = dim_den) %>%
+    relocate(dimension, .before = sub_dimension) %>%
+    relocate(category_type, .after = category)
+
+
+```
+### COMBINE QUESTION SCORES into one df to export to google sheets "question scores"
+The output from this code is a google sheet called "question scores" and this feeds directly into Tableau and is used in the following visualizations and dashboard page MCI Results:
+1) Dimension scores
+2) Sub-Dimension scores
+3) Top 5 Qs with the highest score
+4) Top 5 Qs with the lowest score
+```{r combine ques scores}
+
+question_scores <- bind_rows(mget(ls(pattern = "^final_")))
+
+# Write to existing google sheet "DRAFT MCI Survey Option 1" and name this sheet as mission scores
+question_scores %>%
+  write_sheet(
+    ss = gs4_get(
+      "https://docs.google.com/spreadsheets/d/1LDvLcImAOBl68p1t-gWjII0dQQuAnzLHJuEriXYoNHQ/edit#gid=978742359"
+    ), sheet = "question scores")
+
+
+# rm(list = ls(pattern = "^final_"))
+# rm(list = ls(pattern = "_score*"))
+
+```
+
+
+
+
+## INDIVIDUAL PSE CAPACITY SCORES
+This will output the individual capacity sheet, which doesn't actually measure the average score across any dimensions. Instead it measures the percentage of respondents. The output from these two code chunks feed into the visualizations found on the individual capacity dashboard page
+
+### Individual PSE Capacity by 1) All Responses
+The output from this code is a google sheet called "individual capacity"
+```{r ind_cap, echo=FALSE}
+
+## Ques 4.1, 4.3, 4.4, 4.5 likert scale -----------------
+indclean <- function(x) {
+  
+  # Filter for all questions under ind cap EXCEPT 4.2 since that is yes/no
+  ind_cap <- x %>% 
+    filter(dimension == "Individual PSE Capacity") 
+  
+  # Find frequency of value reported per question
+  # Pivot longer and add total respondents per each question
+  # Tableau can find the percentages later
+  likert <- tabyl(ind_cap, question, value) %>%
+    mutate(total_resp = rowSums(across(where(is.numeric)))) %>%
+    pivot_longer(!c(question, total_resp), 
+                 names_to = "rating",
+                 values_to = "count") %>%
+    relocate(total_resp, .after = count)
+}
+
+# Apply indclean function on the list of missions "missions"  
+ind_cap <- lapply(missions, indclean) 
+  
+# Pull out Mission names from "Mission" list and put them into a vector
+file_names <- names(missions)
+
+# Create a new column called Mission in which Mission will autopopulate with Mission name pulled from Ques_Score from the line above
+for (i in seq_along(ind_cap)) {
+  ind_cap[[i]]$mission<- file_names[i]
+}
+
+# Output each mission scores to the R environment and name each outputted df with pre-fix "Question" to denote these are question scores
+ind_cap_names <- function(dfs, ind_cap) {
+  assign(paste0("indcap_", ind_cap), dfs, envir =.GlobalEnv)
+}
+
+lapply(names(ind_cap), function(name) {
+  ind_cap_names(ind_cap[[name]], name)
+})
+
+# Bind all "indcap_x mission" together into one df so we can output to the googlesheet. This will include all missions
+# 0 is idk, 1 is No and 5 is yes
+final_ind <- bind_rows(mget(ls(pattern = "^indcap_"))) %>%
+  filter(!str_detect(question, "^4.2") | !rating %in% c("2","3","4")) #For ques4.2 ONLY, filter out responses 2,3,4 as it is a binary question 1- No 5 - Yes
+
+# Write to existing google sheet "DRAFT MCI Survey Option 1" and name this sheet as individ capacity
+final_ind %>%
+  write_sheet(
+    ss = gs4_get(
+      "https://docs.google.com/spreadsheets/d/1LDvLcImAOBl68p1t-gWjII0dQQuAnzLHJuEriXYoNHQ/edit#gid=978742359"
+    ), sheet = "individual capacity")
+
+# Remove unnecessary dfs
+rm(list = ls(pattern = "^indcap_"))
+rm(final_ind)
+
+```
+
+## Individual PSE Capacity by Hiring Mechanism and Yrs at Mission
+The output from this code are google sheets called " yrs at mission" and "hiring mechanism"
+```{r hiring mech, echo=FALSE}
+
+# read in raw data again with specific columns of interest
+raw_data2 <- read_sheet(
+  "https://docs.google.com/spreadsheets/d/1LDvLcImAOBl68p1t-gWjII0dQQuAnzLHJuEriXYoNHQ/edit#gid=607136430", sheet = "Form Responses 1", skip = 2) %>%
+  select(-1:-2, -7:-66, -72:-77) 
+
+#Note: If respondents leave these questions blank will need to deal with blanks
+
+missionyr <- raw_data2 %>%
+  group_by(Mission, `Years at Mission`) %>%
+  count() %>%
+  group_by(Mission) %>%
+  mutate(perc_yrs = n/sum(n)) %>%
+  rename(mission = Mission)
+
+hiringmech <- raw_data2 %>%
+  group_by(Mission, `Hiring Mechanism`) %>%
+  count() %>%
+  group_by(Mission) %>%
+  mutate(per_hire = n/sum(n)) %>%
+  rename(mission = Mission)
+
+# Write to existing google sheet "DRAFT MCI Survey Option 1" and name this sheet as yrs at mission
+missionyr %>%
+  write_sheet(
+    ss = gs4_get(
+      "https://docs.google.com/spreadsheets/d/1LDvLcImAOBl68p1t-gWjII0dQQuAnzLHJuEriXYoNHQ/edit#gid=978742359"
+    ), sheet = "yrs at mission")
+
+# Write to existing google sheet "DRAFT MCI Survey Option 1" and name this sheet as hiring mechanism
+hiringmech %>%
+  write_sheet(
+    ss = gs4_get(
+      "https://docs.google.com/spreadsheets/d/1LDvLcImAOBl68p1t-gWjII0dQQuAnzLHJuEriXYoNHQ/edit#gid=978742359"
+    ), sheet = "hiring mechanism")
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
